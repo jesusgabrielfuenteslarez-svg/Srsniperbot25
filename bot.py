@@ -2,31 +2,47 @@ import time
 import requests
 from datetime import datetime
 
+# =============================================
+# SNIPER BOT v11 FINAL
+# - Precio desde Twelve Data (= MT4/MT5)
+# - Fallback a Binance
+# - Alertas noticias económicas
+# - Mensaje Telegram corto y directo
+# =============================================
+
 TG_TOKEN    = '8499195812:AAGRoj18KGtKJAJLHRpijCA2V5xvg-pJKVQ'
 TG_CHAT_ID  = '6467338067'
 TG_GROUP_ID = '-5123266724'
 TG_API      = f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage'
 
+# ─────────────────────────────────────────────
+# ⚠️  PASO OBLIGATORIO:
+#   1. Regístrate GRATIS en https://twelvedata.com
+#   2. Copia tu API Key y pégala aquí abajo
+#   3. El plan free da 800 llamadas/día — más que suficiente
+# ─────────────────────────────────────────────
+TWELVE_API_KEY = '4faa588607814607a01ff11d31e86830'
+
 LOTAJES = [0.01, 0.02, 0.05, 0.08, 0.10, 0.15]
 
 ASSETS = {
-    'gold': {
-        'name': 'XAU/USD ORO', 'icon': '🥇',
-        'tp': 20, 'sl': 10, 'val_pto': 1.0,
-    },
-    'btc': {
-        'name': 'BTC/USD', 'icon': '₿',
-        'tp': 500, 'sl': 200, 'val_pto': 0.01,
-    }
+    'gold': {'name': 'XAU/USD', 'icon': '🥇', 'tp': 20, 'sl': 10, 'val_pto': 1.0},
+    'btc':  {'name': 'BTC/USD', 'icon': '₿',  'tp': 500,'sl': 200,'val_pto': 0.01},
 }
 
-last_signal = {'gold': None, 'btc': None}
-last_signal_time = {'gold': 0, 'btc': 0}
-COOLDOWN = 300
+last_signal      = {'gold': None, 'btc': None}
+last_signal_time = {'gold': 0,    'btc': 0}
+last_news_alert  = 0
+COOLDOWN         = 300   # 5 min entre señales iguales
+NEWS_COOLDOWN    = 1800  # 30 min entre alertas de noticias
 
 def now_str():
     return datetime.now().strftime('%H:%M')
 
+def log(msg):
+    print(f'[{now_str()}] {msg}')
+
+# ---- TELEGRAM ----
 def tg_send(chat_id, msg):
     try:
         r = requests.post(TG_API, json={
@@ -39,11 +55,75 @@ def tg_send(chat_id, msg):
 def send_alert(msg):
     ok1 = tg_send(TG_CHAT_ID, msg)
     ok2 = tg_send(TG_GROUP_ID, msg)
-    print(f'[{now_str()}] TG Jesús:{ok1} Grupo:{ok2}')
+    log(f'TG Jesús:{ok1} Grupo:{ok2}')
     return ok1 or ok2
 
+# ============================================
+# PRECIOS — Twelve Data (= MT4/MT5)
+# ============================================
+
+def get_twelve_prices(symbol, outputsize=60):
+    """
+    Twelve Data: misma fuente de precios que la mayoría de brokers MT4/MT5.
+    Gratis hasta 800 llamadas/día. Registro en twelvedata.com
+    """
+    try:
+        r = requests.get(
+            'https://api.twelvedata.com/time_series',
+            params={
+                'symbol': symbol,
+                'interval': '5min',
+                'outputsize': outputsize,
+                'apikey': TWELVE_API_KEY,
+            },
+            timeout=12
+        )
+        data = r.json()
+
+        if data.get('status') == 'error':
+            log(f'Twelve Data error [{symbol}]: {data.get("message")}')
+            return None
+
+        values = data.get('values', [])
+        if not values:
+            return None
+
+        # values viene orden desc (reciente primero) → invertir
+        closes = [float(v['close']) for v in reversed(values)]
+        log(f'Twelve Data {symbol}: {closes[-1]:.2f}')
+        return closes
+
+    except Exception as e:
+        log(f'Twelve Data excepción [{symbol}]: {e}')
+        return None
+
+def get_twelve_spot(symbol):
+    """Precio spot actual desde Twelve Data."""
+    try:
+        r = requests.get(
+            'https://api.twelvedata.com/price',
+            params={'symbol': symbol, 'apikey': TWELVE_API_KEY},
+            timeout=8
+        )
+        price = float(r.json().get('price', 0))
+        return price if price > 0 else None
+    except Exception as e:
+        log(f'Twelve spot error [{symbol}]: {e}')
+        return None
+
+# ---- ORO ----
 def get_gold_prices():
-    """ORO desde Binance XAUUSDT — precio exacto MT5"""
+    """XAU/USD — precio idéntico a MT4/MT5"""
+
+    # 1. Twelve Data (fuente principal)
+    prices = get_twelve_prices('XAU/USD', 60)
+    if prices and len(prices) >= 15 and prices[-1] > 2000:
+        spot = get_twelve_spot('XAU/USD')
+        if spot and spot > 2000:
+            prices[-1] = spot
+        return prices
+
+    # 2. Fallback: Binance XAUUSDT
     try:
         r = requests.get(
             'https://api.binance.com/api/v3/klines?symbol=XAUUSDT&interval=5m&limit=60',
@@ -51,37 +131,34 @@ def get_gold_prices():
         )
         if r.status_code == 200:
             prices = [float(k[4]) for k in r.json()]
+            t = requests.get(
+                'https://api.binance.com/api/v3/ticker/bookTicker?symbol=XAUUSDT',
+                timeout=5
+            ).json()
+            if 'bidPrice' in t:
+                prices[-1] = (float(t['bidPrice']) + float(t['askPrice'])) / 2
             if prices and prices[-1] > 2000:
-                # Precio actual
-                t = requests.get(
-                    'https://api.binance.com/api/v3/ticker/bookTicker?symbol=XAUUSDT',
-                    timeout=5
-                ).json()
-                if 'bidPrice' in t:
-                    prices[-1] = (float(t['bidPrice']) + float(t['askPrice'])) / 2
-                print(f'[{now_str()}] ORO Binance: {prices[-1]:.2f}')
+                log(f'ORO Binance (fallback): {prices[-1]:.2f}')
                 return prices
     except Exception as e:
-        print(f'ORO Binance error: {e}')
+        log(f'ORO Binance error: {e}')
 
-    # Fallback: Yahoo x2
-    try:
-        r = requests.get(
-            'https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=5m&range=1d',
-            headers={'User-Agent': 'Mozilla/5.0'}, timeout=12
-        )
-        raw = r.json()['chart']['result'][0]['indicators']['quote'][0]['close']
-        prices = [p * 2 + 12.0 for p in raw if p is not None]
-        if prices and prices[-1] > 3000:
-            print(f'[{now_str()}] ORO Yahoo x2: {prices[-1]:.2f}')
-            return prices
-    except Exception as e:
-        print(f'ORO Yahoo error: {e}')
-
+    log('⚠️ Sin datos ORO')
     return None
 
+# ---- BTC ----
 def get_btc_prices():
-    """BTC desde Binance — precio exacto MT5"""
+    """BTC/USD — precio idéntico a MT4/MT5"""
+
+    # 1. Twelve Data (fuente principal)
+    prices = get_twelve_prices('BTC/USD', 60)
+    if prices and len(prices) >= 15 and prices[-1] > 10000:
+        spot = get_twelve_spot('BTC/USD')
+        if spot and spot > 10000:
+            prices[-1] = spot
+        return prices
+
+    # 2. Fallback: Binance BTCUSDT
     try:
         r = requests.get(
             'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=60',
@@ -94,15 +171,72 @@ def get_btc_prices():
         ).json()
         if 'bidPrice' in t:
             prices[-1] = (float(t['bidPrice']) + float(t['askPrice'])) / 2
-        print(f'[{now_str()}] BTC Binance: {prices[-1]:,.0f}')
-        return prices
+        if prices and prices[-1] > 10000:
+            log(f'BTC Binance (fallback): {prices[-1]:,.0f}')
+            return prices
     except Exception as e:
-        print(f'BTC error: {e}')
-        return None
+        log(f'BTC error: {e}')
 
+    log('⚠️ Sin datos BTC')
+    return None
+
+# ---- NOTICIAS ECONÓMICAS ----
+def check_news():
+    """Verificar noticias de alto impacto que afectan al mercado"""
+    global last_news_alert
+    try:
+        r = requests.get(
+            'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
+            timeout=10
+        )
+        events = r.json()
+        high_impact = []
+
+        for event in events:
+            try:
+                if event.get('impact', '') not in ['High', 'high', '3']:
+                    continue
+                if event.get('country', '').upper() not in ['USD', 'EUR', 'GBP']:
+                    continue
+                title = event.get('title', '')
+                keywords = ['fed', 'fomc', 'rate', 'inflation', 'cpi', 'nfp',
+                           'gdp', 'employment', 'powell', 'interest', 'jobs',
+                           'pce', 'ppi', 'retail']
+                if any(k in title.lower() for k in keywords):
+                    high_impact.append({
+                        'title': title,
+                        'time': event.get('time', ''),
+                        'currency': event.get('country', '').upper()
+                    })
+            except:
+                continue
+
+        if high_impact and time.time() - last_news_alert > NEWS_COOLDOWN:
+            last_news_alert = time.time()
+            events_txt = '\n'.join([
+                f"• {e['currency']} {e['time']} — {e['title']}"
+                for e in high_impact[:3]
+            ])
+            msg = (
+                f'⚠️ <b>NOTICIAS DE ALTO IMPACTO</b>\n'
+                f'━━━━━━━━━━━━━━\n'
+                f'🚨 HAY NOTICIAS QUE PUEDEN MOVER EL MERCADO\n'
+                f'NO ABRAS OPERACIONES AHORA\n\n'
+                f'{events_txt}\n'
+                f'━━━━━━━━━━━━━━\n'
+                f'⏳ Espera 30 min tras la noticia'
+            )
+            send_alert(msg)
+            log(f'⚠️ Alerta noticias: {len(high_impact)} eventos')
+            return True
+
+    except Exception as e:
+        log(f'News error: {e}')
+    return False
+
+# ---- INDICADORES ----
 def calc_rsi(prices, n=14):
-    if len(prices) < n + 1:
-        return 50
+    if len(prices) < n + 1: return 50
     g = l = 0
     for i in range(len(prices) - n, len(prices)):
         d = prices[i] - prices[i-1]
@@ -121,8 +255,7 @@ def calc_mom(prices, n=5):
     return prices[-1] - prices[-1-n]
 
 def calc_ac(prices, fast=5, slow=34, sig=5):
-    if len(prices) < slow + sig + 2:
-        return 0, 0
+    if len(prices) < slow + sig + 2: return 0, 0
     def sma(d, n): return sum(d[-n:])/n if len(d) >= n else 0
     ao = [sma(prices[:i], fast) - sma(prices[:i], slow)
           for i in range(slow, len(prices)+1)]
@@ -170,6 +303,7 @@ def calc_prob(prices, direction, range_info):
 
     return min(max(round(prob), 35), 97)
 
+# ---- ANALIZAR Y ALERTAR ----
 def analyze_and_alert(asset_key, prices):
     cfg = ASSETS[asset_key]
     px = prices[-1]
@@ -178,7 +312,6 @@ def analyze_and_alert(asset_key, prices):
     ac_now, ac_prev = calc_ac(prices)
     fmt = lambda v: f'{round(v):,}' if asset_key == 'btc' else f'{v:.2f}'
 
-    # Detectar señal
     sig = None
     if range_info['is_range'] and range_info['size'] > 0:
         sz = range_info['size']
@@ -190,18 +323,17 @@ def analyze_and_alert(asset_key, prices):
         if rsi < 30: sig = 'buy'
         elif rsi > 70: sig = 'sell'
 
-    print(f'[{now_str()}] {cfg["icon"]} {fmt(px)} RSI:{rsi} → {sig or "sin señal"}')
+    log(f'{cfg["icon"]} {fmt(px)} RSI:{rsi} AC:{ac_now:.3f} → {sig or "sin señal"}')
     if not sig: return
 
     prob = calc_prob(prices, sig, range_info)
     if prob < 75:
-        print(f'  Prob {prob}% < 75%, skip')
+        log(f'  Prob {prob}% < 75%, skip')
         return
 
-    # Anti-spam
     sig_key = f'{sig}-{round(px / (cfg["sl"] * 2))}'
     if last_signal[asset_key] == sig_key and time.time() - last_signal_time[asset_key] < COOLDOWN:
-        print(f'  Cooldown activo')
+        log(f'  Cooldown activo')
         return
 
     last_signal[asset_key] = sig_key
@@ -211,59 +343,71 @@ def analyze_and_alert(asset_key, prices):
     tp = px + cfg['tp'] if isBuy else px - cfg['tp']
     sl = px - cfg['sl'] if isBuy else px + cfg['sl']
 
-    if ac_now > 0 and ac_now > ac_prev:   ac_txt = '🟢 Alcista'
-    elif ac_now < 0 and ac_now < ac_prev: ac_txt = '🔴 Bajista'
-    else:                                  ac_txt = '🟡 Neutral'
+    if   ac_now > 0 and ac_now > ac_prev: ac_txt = '🟢'
+    elif ac_now < 0 and ac_now < ac_prev: ac_txt = '🔴'
+    else:                                  ac_txt = '🟡'
 
     lots_txt = '\n'.join([
-        f'{lot:.2f} → +{round(cfg["tp"]*cfg["val_pto"]*lot/0.01,2):.2f}€'
+        f'{lot:.2f} → +{round(cfg["tp"] * cfg["val_pto"] * lot / 0.01, 2):.2f}€'
         for lot in LOTAJES
     ])
 
     emoji = '💚' if isBuy else '🩷'
     tipo  = 'BUY' if isBuy else 'SELL'
 
-    msg = f'''{emoji} <b>{tipo} {cfg["icon"]} {cfg["name"]}</b>
-━━━━━━━━━━━━━━
-📊 <b>{prob}%</b> prob  |  RSI {rsi}  |  AC {ac_txt}
-━━━━━━━━━━━━━━
-📍 Entrada:  <b>{fmt(px)}</b>
-🎯 TP:  <b>{fmt(tp)}</b>  (+{cfg["tp"]} pts)
-🛑 SL:  <b>{fmt(sl)}</b>  (-{cfg["sl"]} pts)
-━━━━━━━━━━━━━━
-💰 Lotaje → Ganancia
-{lots_txt}
-━━━━━━━━━━━━━━
-🕐 {now_str()}'''
+    msg = (
+        f'{emoji} <b>{tipo} {cfg["icon"]} {cfg["name"]}</b>\n'
+        f'📊 <b>{prob}%</b> | RSI {rsi} | AC {ac_txt}\n'
+        f'━━━━━━━━━━━━\n'
+        f'📍 <b>{fmt(px)}</b>\n'
+        f'🎯 {fmt(tp)}  (+{cfg["tp"]})\n'
+        f'🛑 {fmt(sl)}  (-{cfg["sl"]})\n'
+        f'━━━━━━━━━━━━\n'
+        f'{lots_txt}\n'
+        f'🕐 {now_str()}'
+    )
 
     if send_alert(msg):
-        print(f'  ✅ {tipo} {fmt(px)} {prob}%')
+        log(f'✅ {tipo} {fmt(px)} {prob}%')
 
+# ---- MAIN ----
 def main():
-    print('SNIPER BOT v11 — 24/7 — Binance/TradingView')
+    log('SNIPER BOT v11 — INICIANDO')
 
-    send_alert('''🤖 <b>SNIPER BOT v11 — ACTIVO 24/7</b>
-━━━━━━━━━━━━━━
-🥇 ORO:  TP +20 / SL -10 pts
-₿  BTC:  TP +500 / SL -200 pts
-✅ Solo +75% prob  |  ⚡ AC SMO
-⏱ Cada 15 seg  |  Precio = MT5
-━━━━━━━━━━━━━━
-¡Listo! 🚀''')
+    send_alert(
+        '🤖 <b>SNIPER BOT v11 — ACTIVO 24/7</b>\n'
+        '━━━━━━━━━━━━\n'
+        '🥇 ORO  TP+20 / SL-10\n'
+        '₿  BTC  TP+500 / SL-200\n'
+        '✅ Solo +75% | ⚡ AC SMO\n'
+        '📰 Alerta noticias ON\n'
+        '💹 Precio = Twelve Data (MT4/MT5)\n'
+        '━━━━━━━━━━━━\n'
+        '🚀 ¡Listo!'
+    )
 
     scan = 0
     while True:
         try:
             scan += 1
-            print(f'\n--- #{scan} [{now_str()}] ---')
+            log(f'--- Escaneo #{scan} ---')
+
+            if scan % 10 == 0:
+                check_news()
 
             gold_p = get_gold_prices()
-            if gold_p: analyze_and_alert('gold', gold_p)
+            if gold_p:
+                analyze_and_alert('gold', gold_p)
+            else:
+                log('⚠️ Sin datos ORO')
 
             time.sleep(3)
 
             btc_p = get_btc_prices()
-            if btc_p: analyze_and_alert('btc', btc_p)
+            if btc_p:
+                analyze_and_alert('btc', btc_p)
+            else:
+                log('⚠️ Sin datos BTC')
 
             time.sleep(12)
 
@@ -271,7 +415,7 @@ def main():
             send_alert('⛔ <b>SNIPER BOT</b> — Detenido')
             break
         except Exception as e:
-            print(f'Error: {e}')
+            log(f'Error: {e}')
             time.sleep(15)
 
 if __name__ == '__main__':
