@@ -19,6 +19,14 @@ TWELVE_API_KEY = 'TU_API_KEY_AQUI'   # <-- pon tu key aqui
 
 LOTAJES = [0.01, 0.02, 0.05, 0.08, 0.10, 0.15]
 
+# Sesiones de trading (hora UTC)
+# Londres:  07:00 - 16:00 UTC
+# New York: 12:00 - 21:00 UTC
+SESSIONS = [
+    (7,  16),   # Londres
+    (12, 21),   # New York
+]
+
 ASSETS = {
     'gold': {'name': 'XAU/USD', 'icon': '🥇', 'tp': 20,  'sl': 10,  'val_pto': 1.0},
     'btc':  {'name': 'BTC/USD', 'icon': '₿',  'tp': 500, 'sl': 200, 'val_pto': 0.01},
@@ -35,6 +43,15 @@ SUMMARY_HOUR   = 23
 # Noticias — guardamos los titulos ya alertados para no repetir
 news_alerted_today = set()
 news_active = False  # True cuando hay noticias de alto impacto hoy
+
+# ── Umbral adaptativo ─────────────────────────
+BASE_THRESHOLD  = 80   # minimo siempre
+NEWS_THRESHOLD  = 90   # con noticias activas
+current_threshold = 80 # se ajusta automaticamente
+consecutive_sl  = 0    # racha negativa consecutiva
+paused_until    = 0    # timestamp hasta cuando esta pausado
+signals_today   = 0    # contador de senales del dia (max 10)
+MAX_SIGNALS_DAY = 10   # objetivo: calidad sobre cantidad
 last_news_check    = 0
 NEWS_CHECK_INTERVAL = 600   # revisar noticias cada 10 min (no cada ciclo)
 
@@ -149,6 +166,25 @@ def get_spot_price(asset_key):
     return None
 
 # =============================================
+# SESIONES DE TRADING
+# =============================================
+
+def is_market_open():
+    """True si estamos dentro de sesion Londres o New York (UTC)"""
+    hour = datetime.utcnow().hour
+    for start, end in SESSIONS:
+        if start <= hour < end:
+            return True
+    return False
+
+def session_name():
+    hour = datetime.utcnow().hour
+    if 7 <= hour < 12:   return "Londres"
+    if 12 <= hour < 16:  return "Londres + New York"
+    if 16 <= hour < 21:  return "New York"
+    return None
+
+# =============================================
 # NOTICIAS — alerta UNA sola vez por evento
 # =============================================
 
@@ -240,14 +276,22 @@ def _send_summary():
         f'Efectividad: <b>{pct}%</b> {stars}\n'
         f'Total: {total} senales\n'
         f'ORO  {tp_g} TP  {sl_g} SL\n'
-        f'BTC  {tp_b} TP  {sl_b} SL'
+        f'BTC  {tp_b} TP  {sl_b} SL\n'
+        f'Umbral activo: {current_threshold}%\n'
+        f'Senales emitidas: {signals_today}'
     )
     log(f'Resumen enviado: {pct}% ({total_tp}/{total})')
 
 def _reset_stats():
+    global current_threshold, consecutive_sl, paused_until
     for k in stats:
         stats[k]['tp'] = 0
         stats[k]['sl'] = 0
+    current_threshold = BASE_THRESHOLD
+    consecutive_sl    = 0
+    paused_until      = 0
+    signals_today     = 0
+    log(f'Stats reseteadas — umbral vuelve a {BASE_THRESHOLD}%')
 
 # =============================================
 # INDICADORES
@@ -353,6 +397,17 @@ def check_active_signals():
 
         if hit_tp:
             stats[sig['asset']]['tp'] += 1
+            global consecutive_sl, current_threshold, paused_until
+            consecutive_sl = 0  # reset racha negativa
+            # Recalibrar: si efectividad >= 80% bajar umbral hacia base
+            total_tp = stats['gold']['tp'] + stats['btc']['tp']
+            total_sl = stats['gold']['sl'] + stats['btc']['sl']
+            total = total_tp + total_sl
+            if total >= 5:
+                eff = (total_tp / total) * 100
+                if eff >= 80 and current_threshold > BASE_THRESHOLD:
+                    current_threshold = max(current_threshold - 5, BASE_THRESHOLD)
+                    log(f'Efectividad {round(eff)}% — umbral bajado a {current_threshold}%')
             send_alert(
                 f'<b>TP {cfg["icon"]} +{cfg["tp"]}</b>\n'
                 f'{fmt(sig["entry"])} a {fmt(price)}\n'
@@ -363,6 +418,29 @@ def check_active_signals():
 
         elif hit_sl:
             stats[sig['asset']]['sl'] += 1
+            global consecutive_sl, current_threshold, paused_until
+            consecutive_sl += 1
+            # Reajuste si efectividad < 80%
+            total_tp = stats['gold']['tp'] + stats['btc']['tp']
+            total_sl = stats['gold']['sl'] + stats['btc']['sl']
+            total = total_tp + total_sl
+            if total >= 3:
+                eff = (total_tp / total) * 100
+                if eff < 80:
+                    current_threshold = min(current_threshold + 5, 95)
+                    log(f'Efectividad {round(eff)}% < 80% — umbral subido a {current_threshold}%')
+            # Pausa si 3 SL seguidos
+            if consecutive_sl >= 3:
+                paused_until = time.time() + 1800  # pausa 30 min
+                current_threshold = min(current_threshold + 5, 95)
+                send_alert(
+                    f'REPLANTEANDO ESTRATEGIA\n'
+                    f'3 SL consecutivos detectados\n'
+                    f'Pausa 30 min | Nuevo umbral: {current_threshold}%\n'
+                    f'{now_str()}'
+                )
+                consecutive_sl = 0
+                log(f'3 SL seguidos — pausa 30 min, umbral {current_threshold}%')
             send_alert(
                 f'<b>SL {cfg["icon"]} -{cfg["sl"]}</b>\n'
                 f'{fmt(sig["entry"])} a {fmt(price)}\n'
@@ -400,9 +478,24 @@ def analyze_and_alert(asset_key, prices):
     if not sig: return
 
     prob = calc_prob(prices, sig, range_info)
-    umbral = 90 if news_active else 80
+    # Umbral adaptativo
+    if time.time() < paused_until:
+        mins_left = round((paused_until - time.time()) / 60)
+        log(f'  BOT EN PAUSA — {mins_left} min restantes')
+        return
+
+    # Fuera de sesion: solo senales excepcionales (95%+)
+    # Dentro de sesion: umbral normal adaptativo
+    if not is_market_open():
+        umbral = 95
+    elif news_active:
+        umbral = max(NEWS_THRESHOLD, current_threshold)
+    else:
+        umbral = max(current_threshold, BASE_THRESHOLD)
+
     if prob < umbral:
-        log(f'  {prob}% < {umbral}% (noticias={news_active}), skip')
+        sesion = session_name() or "fuera de sesion"
+        log(f'  {prob}% < {umbral}% ({sesion}), skip')
         return
 
     sig_key = f'{sig}-{round(px / (cfg["sl"] * 2))}'
@@ -429,6 +522,17 @@ def analyze_and_alert(asset_key, prices):
 
     tipo = 'BUY' if isBuy else 'SELL'
 
+    global signals_today
+    signals_today += 1
+
+    # Recomendar lotaje segun probabilidad
+    if prob >= 90:
+        lote_rec = '0.10 o 0.15 (senal fuerte)'
+        lote_ico = '💪'
+    else:
+        lote_rec = '0.01 a 0.05 (senal moderada)'
+        lote_ico = '👌'
+
     send_alert(
         f'<b>{tipo} {cfg["icon"]} {cfg["name"]} {prob}%</b>\n'
         f'RSI {rsi} | {ac_txt}\n'
@@ -436,10 +540,11 @@ def analyze_and_alert(asset_key, prices):
         f'TP: {fmt(tp)} (+{cfg["tp"]})\n'
         f'SL: {fmt(sl)} (-{cfg["sl"]})\n'
         f'---\n'
+        f'{lote_ico} Lotaje recomendado: {lote_rec}\n'
         f'{lots_txt}\n'
-        f'{now_str()}'
+        f'Senal {signals_today}/{MAX_SIGNALS_DAY} | {session_name()} | {now_str()}'
     )
-    log(f'{tipo} {fmt(px)} {prob}%')
+    log(f'{tipo} {fmt(px)} {prob}% — senal {signals_today}/{MAX_SIGNALS_DAY}')
 
     active_signals.append({
         'asset': asset_key, 'direction': sig,
