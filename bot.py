@@ -34,6 +34,7 @@ SUMMARY_HOUR   = 23
 
 # Noticias — guardamos los titulos ya alertados para no repetir
 news_alerted_today = set()
+news_active = False  # True cuando hay noticias de alto impacto hoy
 last_news_check    = 0
 NEWS_CHECK_INTERVAL = 600   # revisar noticias cada 10 min (no cada ciclo)
 
@@ -164,6 +165,7 @@ def check_news():
     if not hasattr(check_news, '_day') or check_news._day != today:
         check_news._day = today
         news_alerted_today.clear()
+        news_active = False
         log('Noticias: nuevo dia, lista reseteada')
 
     try:
@@ -193,10 +195,11 @@ def check_news():
             txt = '\n'.join([f'- {e}' for e in nuevas[:3]])
             send_alert(
                 f'<b>NOTICIAS ALTO IMPACTO</b>\n'
-                f'NO OPERAR AHORA\n\n'
+                f'PRECAUCION AL OPERAR\n\n'
                 f'{txt}\n\n'
                 f'Espera 30 min tras la noticia'
             )
+            news_active = True
             log(f'Alerta noticias: {len(nuevas)} eventos nuevos')
 
     except Exception as e:
@@ -397,8 +400,9 @@ def analyze_and_alert(asset_key, prices):
     if not sig: return
 
     prob = calc_prob(prices, sig, range_info)
-    if prob < 75:
-        log(f'  {prob}% < 75%, skip')
+    umbral = 90 if news_active else 80
+    if prob < umbral:
+        log(f'  {prob}% < {umbral}% (noticias={news_active}), skip')
         return
 
     sig_key = f'{sig}-{round(px / (cfg["sl"] * 2))}'
@@ -453,7 +457,7 @@ def main():
     send_alert(
         '<b>SNIPER BOT v11.4 ACTIVO</b>\n'
         'ORO TP+20 SL-10 | BTC TP+500 SL-200\n'
-        '+75% | AC SMO | TP/SL | Resumen 23:00'
+        '+80% | AC SMO | TP/SL | Resumen 23:00'
     )
 
     scan = 0
