@@ -24,8 +24,10 @@ GAINS = {
 
 # ── CAPA 1: Bloques horarios premium (UTC) ────
 SESSIONS = [
-    (7,  11),   # Apertura Londres — direccion inicial ORO
-    (13, 17),   # Solapamiento NY  — maximo volumen
+    (22, 24),   # Apertura Sydney/Tokyo — medianoche Barcelona
+    (0,  2),    # Continuacion Asia
+    (6,  12),   # Londres completo — 08-14h Barcelona
+    (13, 20),   # NY completo — 15-22h Barcelona
 ]
 
 # ── CAPA 2: 1 trade por activo por sesion ─────
@@ -109,9 +111,9 @@ def check_news():
             except: continue
 
         if nuevas:
-            news_blocked_until = time.time() + 1800  # pausa 30 min
+            news_blocked_until = time.time() + 900   # pausa 15 min
             txt = '\n'.join([f'• {e}' for e in nuevas[:3]])
-            send(f'<b>⚠️ NOTICIA ALTO IMPACTO</b>\n{txt}\n\nPausa 30 min — vuelvo después')
+            send(f'<b>⚠️ NOTICIA ALTO IMPACTO</b>\n{txt}\n\nPausa 15 min — vuelvo después')
             log(f'Noticias detectadas — pausa 30 min')
 
     except Exception as e:
@@ -490,11 +492,10 @@ def analyze(asset, data):
     btc  = asset == 'btc'
     fmt  = (lambda v: f'{round(v):,}') if btc else (lambda v: f'{v:.2f}')
 
-    # CAPA 1: Solo en sesion premium
+    # CAPA 1: Sesiones premium = bonus de score
+    # Fuera de sesion: umbral mas alto pero NUNCA bloqueado
     sess = current_session()
-    if sess is None:
-        log(f'{cfg["icon"]} Fuera de sesion premium — skip')
-        return
+    score_threshold = 58 if sess is not None else 68
 
     # CAPA 4: Noticias
     if time.time() < news_blocked_until:
@@ -569,7 +570,7 @@ def analyze(asset, data):
 
     log(f'{cfg["icon"]} {fmt(px)} {sig.upper()} Score:{score} {reasons}')
 
-    if score < 65:
+    if score < 58:
         log(f'  Score {score} < 65 — no pasa el filtro')
         return
 
@@ -620,7 +621,7 @@ def main():
          '🥇 ORO 🎯+20 🛑-10\n'
          '₿  BTC 🎯+500 🛑-200\n'
          '5 capas ultra-filtro\n'
-         '⏰ Londres 07-11 | NY 13-17 UTC')
+         '⏰ Asia 00h | Londres 08h | NY 15h\n24/7 — señales en cualquier momento')
 
     while True:
         try:
